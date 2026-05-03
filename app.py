@@ -3,7 +3,7 @@ import pandas as pd
 import numpy as np
 import plotly.express as px
 import plotly.graph_objects as go
-from sklearn.preprocessing import LabelEncoder, StandardScaler
+from sklearn.preprocessing import LabelEncoder, StandardScaler, OneHotEncoder
 from sklearn.cluster import KMeans, AgglomerativeClustering
 from sklearn.metrics import silhouette_score
 from scipy.cluster.hierarchy import dendrogram, linkage
@@ -44,6 +44,23 @@ def load_data():
     properties['sale_price'] = properties['sale_price'].str.replace(
         '[\$,]', '', regex=True).astype(float)
 
+    # Remove duplicates
+    clients = clients.drop_duplicates()
+    properties = properties.drop_duplicates()
+
+    # Handle missing values
+    clients = clients.fillna(clients.mode().iloc[0])
+    properties = properties.fillna(properties.mode().iloc[0])
+
+    # Normalize categorical labels
+    clients['gender'] = clients['gender'].str.strip().str.upper()
+    clients['client_type'] = clients['client_type'].str.strip().str.title()
+    clients['acquisition_purpose'] = clients['acquisition_purpose'].str.strip().str.title()
+    clients['loan_applied'] = clients['loan_applied'].str.strip().str.title()
+    clients['referral_channel'] = clients['referral_channel'].str.strip().str.title()
+    clients['country'] = clients['country'].str.strip().str.title()
+    clients['region'] = clients['region'].str.strip().str.title()
+
     # Calculate age
     clients['date_of_birth'] = pd.to_datetime(
         clients['date_of_birth'], dayfirst=True, errors='coerce')
@@ -66,42 +83,54 @@ clients, properties, merged = load_data()
 def run_clustering(n_clusters=4):
     df = clients.copy()
 
-    # Encode categorical columns
+    # ── Label Encoding (for low-cardinality columns) ──
     le = LabelEncoder()
-    encode_cols = ['client_type', 'gender', 'country',
-                   'region', 'acquisition_purpose',
-                   'loan_applied', 'referral_channel']
+    label_encode_cols = ['gender', 'loan_applied',
+                         'acquisition_purpose', 'client_type',
+                         'referral_channel']
+    for col in label_encode_cols:
+        df[col + '_le'] = le.fit_transform(df[col].astype(str))
 
-    for col in encode_cols:
-        df[col + '_enc'] = le.fit_transform(df[col].astype(str))
+    # ── One-Hot Encoding (for country & region) ──
+    ohe_cols = ['country', 'region']
+    ohe = OneHotEncoder(sparse_output=False, handle_unknown='ignore')
+    ohe_array = ohe.fit_transform(df[ohe_cols])
+    ohe_feature_names = ohe.get_feature_names_out(ohe_cols)
+    ohe_df = pd.DataFrame(ohe_array,
+                          columns=ohe_feature_names,
+                          index=df.index)
+    df = pd.concat([df, ohe_df], axis=1)
 
-    # Feature matrix
-    features = ['age', 'satisfaction_score',
-                'client_type_enc', 'gender_enc',
-                'acquisition_purpose_enc',
-                'loan_applied_enc', 'referral_channel_enc']
+    # ── Feature Matrix ──
+    label_features = ['age', 'satisfaction_score',
+                      'gender_le', 'loan_applied_le',
+                      'acquisition_purpose_le',
+                      'client_type_le', 'referral_channel_le']
+    ohe_features = list(ohe_feature_names)
+    all_features = label_features + ohe_features
 
-    X = df[features].dropna()
+    X = df[all_features].dropna()
 
-    # Scale features
+    # ── Feature Scaling ──
     scaler = StandardScaler()
     X_scaled = scaler.fit_transform(X)
 
-    # KMeans clustering
-    kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
+    # ── K-Means Clustering ──
+    kmeans = KMeans(n_clusters=n_clusters,
+                    random_state=42, n_init=10)
     df.loc[X.index, 'KMeans_Cluster'] = kmeans.fit_predict(X_scaled)
     df['KMeans_Cluster'] = df['KMeans_Cluster'].fillna(-1).astype(int)
 
-    # Hierarchical clustering
+    # ── Hierarchical Clustering ──
     hierarchical = AgglomerativeClustering(n_clusters=n_clusters)
     df.loc[X.index, 'Hierarchical_Cluster'] = hierarchical.fit_predict(X_scaled)
     df['Hierarchical_Cluster'] = df['Hierarchical_Cluster'].fillna(-1).astype(int)
 
-    # Silhouette scores
+    # ── Silhouette Scores ──
     kmeans_sil = silhouette_score(X_scaled, kmeans.labels_)
     hier_sil = silhouette_score(X_scaled, hierarchical.labels_)
 
-    # Elbow data
+    # ── Elbow Method ──
     inertias = []
     k_range = range(2, 10)
     for k in k_range:
@@ -109,11 +138,13 @@ def run_clustering(n_clusters=4):
         km.fit(X_scaled)
         inertias.append(km.inertia_)
 
-    # Linkage matrix for dendrogram (sample 200 rows for speed)
+    # ── Linkage Matrix for Dendrogram ──
     sample = X_scaled[:200]
     linkage_matrix = linkage(sample, method='ward')
 
-    return df, kmeans_sil, hier_sil, list(k_range), inertias, linkage_matrix, X_scaled
+    return (df, kmeans_sil, hier_sil,
+            list(k_range), inertias,
+            linkage_matrix, X_scaled)
 
 # Cluster labels
 cluster_labels = {
@@ -177,7 +208,9 @@ if selected_type != "All":
     filtered = filtered[filtered['client_type'] == selected_type]
 
 # Run clustering
-clustered_df, kmeans_sil, hier_sil, k_range, inertias, linkage_matrix, X_scaled = run_clustering(n_clusters)
+(clustered_df, kmeans_sil, hier_sil,
+ k_range, inertias, linkage_matrix, X_scaled) = run_clustering(n_clusters)
+
 clustered_df['Cluster Label'] = clustered_df['KMeans_Cluster'].map(
     lambda x: cluster_labels.get(x, f"Cluster {x}"))
 clustered_df['Hier Label'] = clustered_df['Hierarchical_Cluster'].map(
@@ -270,14 +303,17 @@ elif page == "👥 Buyer Segmentation":
         st.subheader("📊 Cluster Distribution")
         cluster_counts = clustered_df['Cluster Label'].value_counts().reset_index()
         cluster_counts.columns = ['Segment', 'Count']
-        fig = px.pie(cluster_counts, names='Segment', values='Count',
+        fig = px.pie(cluster_counts,
+                     names='Segment', values='Count',
                      template='plotly_dark',
-                     color_discrete_sequence=list(cluster_colors.values()))
+                     color_discrete_sequence=list(
+                         cluster_colors.values()))
         st.plotly_chart(fig, use_container_width=True)
 
     with col2:
         st.subheader("📉 Elbow Method")
-        elbow_df = pd.DataFrame({'K': k_range, 'Inertia': inertias})
+        elbow_df = pd.DataFrame(
+            {'K': k_range, 'Inertia': inertias})
         fig = px.line(elbow_df, x='K', y='Inertia',
                       markers=True,
                       template='plotly_dark',
@@ -288,7 +324,8 @@ elif page == "👥 Buyer Segmentation":
     col1, col2 = st.columns(2)
     with col1:
         st.subheader("📊 Age Distribution by Segment")
-        fig = px.box(clustered_df, x='Cluster Label', y='age',
+        fig = px.box(clustered_df,
+                     x='Cluster Label', y='age',
                      color='Cluster Label',
                      template='plotly_dark',
                      color_discrete_map=cluster_colors)
@@ -309,7 +346,8 @@ elif page == "👥 Buyer Segmentation":
         Count=('client_id', 'count'),
         Avg_Age=('age', 'mean'),
         Avg_Satisfaction=('satisfaction_score', 'mean'),
-        Loan_Yes=('loan_applied', lambda x: (x == 'Yes').sum()),
+        Loan_Yes=('loan_applied',
+                  lambda x: (x == 'Yes').sum()),
         Investment_Purpose=('acquisition_purpose',
                             lambda x: (x == 'Investment').sum())
     ).round(2).reset_index()
@@ -321,10 +359,9 @@ elif page == "👥 Buyer Segmentation":
 elif page == "🔬 Hierarchical Clustering":
     st.title("🔬 Hierarchical Clustering Analysis")
     st.markdown(
-        "Hierarchical clustering reveals nested relationships and validates K-Means results")
+        "Reveals nested cluster relationships & validates K-Means")
     st.markdown("---")
 
-    # Metrics comparison
     col1, col2, col3 = st.columns(3)
     with col1:
         st.metric("🎯 K-Means Silhouette", f"{kmeans_sil:.3f}")
@@ -336,18 +373,16 @@ elif page == "🔬 Hierarchical Clustering":
 
     st.markdown("---")
 
-    # Dendrogram
     st.subheader("🌳 Dendrogram — Hierarchical Cluster Tree")
-    st.markdown("Shows how buyers are grouped at different levels — sample of 200 buyers")
+    st.markdown(
+        "Shows how buyers are grouped — sample of 200 buyers")
 
     fig_dend, ax = plt.subplots(figsize=(12, 5))
     fig_dend.patch.set_facecolor('#0e1117')
     ax.set_facecolor('#0e1117')
     dendrogram(
-        linkage_matrix,
-        ax=ax,
-        truncate_mode='level',
-        p=5,
+        linkage_matrix, ax=ax,
+        truncate_mode='level', p=5,
         color_threshold=0.7 * max(linkage_matrix[:, 2]),
         above_threshold_color='#888888'
     )
@@ -364,40 +399,41 @@ elif page == "🔬 Hierarchical Clustering":
 
     col1, col2 = st.columns(2)
     with col1:
-        st.subheader("📊 Hierarchical Cluster Distribution")
-        hier_counts = clustered_df['Hier Label'].value_counts().reset_index()
+        st.subheader("📊 Hierarchical Distribution")
+        hier_counts = clustered_df['Hier Label'].value_counts(
+        ).reset_index()
         hier_counts.columns = ['Segment', 'Count']
         fig = px.pie(hier_counts,
                      names='Segment', values='Count',
                      template='plotly_dark',
-                     color_discrete_sequence=list(cluster_colors.values()))
+                     color_discrete_sequence=list(
+                         cluster_colors.values()))
         st.plotly_chart(fig, use_container_width=True)
 
     with col2:
-        st.subheader("📊 K-Means vs Hierarchical Comparison")
+        st.subheader("📊 Model Quality Comparison")
         comparison_data = pd.DataFrame({
             'Model': ['K-Means', 'Hierarchical'],
             'Silhouette Score': [kmeans_sil, hier_sil]
         })
         fig = px.bar(comparison_data,
-                     x='Model',
-                     y='Silhouette Score',
+                     x='Model', y='Silhouette Score',
                      color='Model',
                      template='plotly_dark',
-                     color_discrete_sequence=['#00d4ff', '#ff9900'],
+                     color_discrete_sequence=[
+                         '#00d4ff', '#ff9900'],
                      title='Model Quality Comparison')
         fig.update_layout(yaxis_range=[0, 1])
         st.plotly_chart(fig, use_container_width=True)
 
     st.markdown("---")
-
-    # Side by side segment comparison
-    st.subheader("🔍 Segment Comparison — K-Means vs Hierarchical")
+    st.subheader("🔍 K-Means vs Hierarchical Comparison")
     col1, col2 = st.columns(2)
 
     with col1:
         st.markdown("**K-Means Segments:**")
-        kmeans_summary = clustered_df.groupby('Cluster Label').agg(
+        kmeans_summary = clustered_df.groupby(
+            'Cluster Label').agg(
             Count=('client_id', 'count'),
             Avg_Age=('age', 'mean'),
             Avg_Satisfaction=('satisfaction_score', 'mean')
@@ -416,8 +452,7 @@ elif page == "🔬 Hierarchical Clustering":
     st.markdown("---")
     st.subheader("📊 Age Distribution — Hierarchical Segments")
     fig = px.box(clustered_df,
-                 x='Hier Label',
-                 y='age',
+                 x='Hier Label', y='age',
                  color='Hier Label',
                  template='plotly_dark',
                  color_discrete_map=cluster_colors)
@@ -443,7 +478,8 @@ elif page == "📈 Investor Behavior":
                      color='acquisition_purpose',
                      barmode='group',
                      template='plotly_dark',
-                     color_discrete_sequence=['#00d4ff', '#ff9900'])
+                     color_discrete_sequence=[
+                         '#00d4ff', '#ff9900'])
         st.plotly_chart(fig, use_container_width=True)
 
     with col2:
@@ -456,7 +492,8 @@ elif page == "📈 Investor Behavior":
                      color='loan_applied',
                      barmode='group',
                      template='plotly_dark',
-                     color_discrete_sequence=['#00ff88', '#ff4444'])
+                     color_discrete_sequence=[
+                         '#00ff88', '#ff4444'])
         st.plotly_chart(fig, use_container_width=True)
 
     col1, col2 = st.columns(2)
@@ -482,7 +519,8 @@ elif page == "📈 Investor Behavior":
                      color='client_type',
                      barmode='group',
                      template='plotly_dark',
-                     color_discrete_sequence=['#00d4ff', '#ff9900'])
+                     color_discrete_sequence=[
+                         '#00d4ff', '#ff9900'])
         st.plotly_chart(fig, use_container_width=True)
 
     st.markdown("---")
@@ -499,11 +537,13 @@ elif page == "📈 Investor Behavior":
 
     with col2:
         st.subheader("🏢 Unit Category Distribution")
-        uc = properties['unit_category'].value_counts().reset_index()
+        uc = properties['unit_category'].value_counts(
+        ).reset_index()
         uc.columns = ['Category', 'Count']
         fig = px.pie(uc, names='Category', values='Count',
                      template='plotly_dark',
-                     color_discrete_sequence=['#00d4ff', '#ff9900'])
+                     color_discrete_sequence=[
+                         '#00d4ff', '#ff9900'])
         st.plotly_chart(fig, use_container_width=True)
 
 # ============================================================
@@ -517,7 +557,8 @@ elif page == "🗺️ Geographic Analysis":
     col1, col2 = st.columns(2)
     with col1:
         st.subheader("🌍 Buyers by Country")
-        country_counts = filtered['country'].value_counts().reset_index()
+        country_counts = filtered['country'].value_counts(
+        ).reset_index()
         country_counts.columns = ['Country', 'Count']
         fig = px.bar(country_counts,
                      x='Country', y='Count',
@@ -563,13 +604,15 @@ elif page == "🗺️ Geographic Analysis":
                      color='acquisition_purpose',
                      barmode='group',
                      template='plotly_dark',
-                     color_discrete_sequence=['#00d4ff', '#ff9900'])
+                     color_discrete_sequence=[
+                         '#00d4ff', '#ff9900'])
         fig.update_layout(xaxis_tickangle=-45)
         st.plotly_chart(fig, use_container_width=True)
 
     st.markdown("---")
     st.subheader("📊 Top 15 Regions by Buyer Count")
-    top_regions = filtered['region'].value_counts().head(15).reset_index()
+    top_regions = filtered['region'].value_counts().head(
+        15).reset_index()
     top_regions.columns = ['Region', 'Count']
     fig = px.bar(top_regions,
                  x='Region', y='Count',
@@ -619,7 +662,8 @@ elif page == "🔍 Segment Insights":
 
     with col1:
         st.subheader("🌍 Countries in Segment")
-        seg_country = segment_df['country'].value_counts().reset_index()
+        seg_country = segment_df['country'].value_counts(
+        ).reset_index()
         seg_country.columns = ['Country', 'Count']
         fig = px.pie(seg_country,
                      names='Country', values='Count',
@@ -641,12 +685,14 @@ elif page == "🔍 Segment Insights":
     col1, col2 = st.columns(2)
     with col1:
         st.subheader("👥 Gender Distribution")
-        seg_gender = segment_df['gender'].value_counts().reset_index()
+        seg_gender = segment_df['gender'].value_counts(
+        ).reset_index()
         seg_gender.columns = ['Gender', 'Count']
         fig = px.pie(seg_gender,
                      names='Gender', values='Count',
                      template='plotly_dark',
-                     color_discrete_sequence=['#00d4ff', '#ff9900'])
+                     color_discrete_sequence=[
+                         '#00d4ff', '#ff9900'])
         st.plotly_chart(fig, use_container_width=True)
 
     with col2:
