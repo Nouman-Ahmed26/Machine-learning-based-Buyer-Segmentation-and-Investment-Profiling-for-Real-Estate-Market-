@@ -3,3 +3,5 @@ numpy
 plotly
 scikit-learn
 streamlit
+scipy
+matplotlib
